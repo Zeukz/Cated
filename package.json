@@ -1,0 +1,74 @@
+{
+  "name": "cated",
+  "version": "0.1.0",
+  "description": "Aplicativo privado de comunicação entre amigos para Windows",
+  "main": "electron/main.cjs",
+  "author": "Cated",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zeukz/Cated.git"
+  },
+  "homepage": "https://github.com/Zeukz/Cated",
+  "bugs": {
+    "url": "https://github.com/Zeukz/Cated/issues"
+  },
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "build": "vite build",
+    "start": "electron .",
+    "dist": "npm run build && electron-builder --win --x64",
+    "release:publish": "npm run build && electron-builder --win --x64 --publish always",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "latest",
+    "@supabase/supabase-js": "latest",
+    "electron-updater": "^6.8.9"
+  },
+  "devDependencies": {
+    "concurrently": "latest",
+    "electron": "latest",
+    "electron-builder": "latest",
+    "wait-on": "latest"
+  },
+  "build": {
+    "appId": "com.zeukz.cated",
+    "productName": "Cated",
+    "artifactName": "Cated-Setup-${version}.${ext}",
+    "npmRebuild": false,
+    "electronDist": "./node_modules/electron/dist",
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "Zeukz",
+        "repo": "Cated",
+        "releaseType": "release"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  }
+}
