@@ -18,8 +18,8 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on http://127.0.0.1:5173 && electron .\"",
     "build": "vite build",
     "start": "electron .",
-    "dist": "npm run build && electron-builder --win --x64",
-    "release:publish": "npm run build && electron-builder --win --x64 --publish always",
+    "dist": "npm run build && electron-builder --win --x64 --config.electronDist=./node_modules/electron/dist",
+    "release:publish": "npm run build && electron-builder --win --x64 --config.electronDist=./node_modules/electron/dist --publish always",
     "preview": "vite preview"
   },
   "dependencies": {
@@ -42,7 +42,6 @@
     "productName": "Cated",
     "artifactName": "Cated-Setup-${version}.${ext}",
     "npmRebuild": false,
-    "electronDist": "./node_modules/electron/dist",
     "files": [
       "dist/**/*",
       "electron/**/*"
