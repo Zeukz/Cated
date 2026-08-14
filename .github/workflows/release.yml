@@ -33,6 +33,9 @@ jobs:
 
       - name: Gerar a aplicação web
         run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
 
       - name: Gerar o instalador sem publicar
         run: npx electron-builder --win --x64 --publish never
