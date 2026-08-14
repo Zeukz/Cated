@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,7 +29,20 @@ jobs:
       - name: Gerar a aplicação web
         run: npm run build
 
-      - name: Gerar e publicar o instalador
-        run: npx electron-builder --win --x64 --publish always
+      - name: Gerar o instalador sem publicar
+        run: npx electron-builder --win --x64 --publish never
+
+      - name: Criar ou atualizar o release com upload sequencial
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = $env:RELEASE_TAG
+          $releaseExists = gh release view $tag --repo $env:REPOSITORY 2>$null
+          if (-not $releaseExists) {
+            gh release create $tag --repo $env:REPOSITORY --title "Cated $version" --notes "Release automático do Cated $version"
+          }
+          gh release upload $tag "release/Cated-Setup-$version.exe" "release/Cated-Setup-$version.exe.blockmap" "release/latest.yml" --repo $env:REPOSITORY --clobber
