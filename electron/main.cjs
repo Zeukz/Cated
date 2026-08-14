@@ -44,7 +44,8 @@ function configureAutoUpdater() {
   if (isDevelopment) return;
 
   // O instalador NSIS será por usuário. A instalação só ocorre quando a pessoa confirmar.
-  autoUpdater.autoDownload = true;
+  // A pessoa escolhe quando iniciar o download; a descoberta da versão não fica silenciosa.
+  autoUpdater.autoDownload = false;
   autoUpdater.autoInstallOnAppQuit = false;
   autoUpdater.fullChangelog = true;
 
@@ -52,8 +53,24 @@ function configureAutoUpdater() {
     console.log('[Atualizações] Verificando novas versões...');
   });
 
-  autoUpdater.on('update-available', (info) => {
-    showUpdateNotification('Atualização disponível', `A versão ${info.version} do Cated está sendo baixada.`);
+  autoUpdater.on('update-available', async (info) => {
+    showUpdateNotification('Atualização disponível', `A versão ${info.version} do Cated está disponível.`);
+    const result = await dialog.showMessageBox(mainWindow || BrowserWindow.getFocusedWindow(), {
+      type: 'info',
+      title: 'Atualização disponível',
+      message: `O Cated encontrou a versão ${info.version}.`,
+      detail: 'Deseja baixar a atualização agora? Você poderá continuar usando o aplicativo durante o download.',
+      buttons: ['Baixar atualização', 'Mais tarde'],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true
+    });
+    if (result.response === 0) {
+      autoUpdater.downloadUpdate().catch((error) => {
+        showUpdateNotification('Falha na atualização', 'Não foi possível iniciar o download. Tente novamente mais tarde.');
+        console.warn('[Atualizações] Falha no download:', error?.message || error);
+      });
+    }
   });
 
   autoUpdater.on('update-not-available', () => {
@@ -92,8 +109,8 @@ function configureAutoUpdater() {
     });
   };
 
-  setTimeout(checkForUpdates, 8000);
-  updateCheckTimer = setInterval(checkForUpdates, 4 * 60 * 60 * 1000);
+  setTimeout(checkForUpdates, 3000);
+  updateCheckTimer = setInterval(checkForUpdates, 30 * 60 * 1000);
 }
 
 app.whenReady().then(() => {
