@@ -29,46 +29,10 @@ import {
 import './styles.css';
 import { isSupabaseConfigured, supabase } from './supabase';
 
-const initialMessages = [
-  {
-    id: 1,
-    author: 'Marina Costa',
-    initials: 'MC',
-    color: 'coral',
-    time: 'Hoje às 14:18',
-    text: 'Pessoal, criei este espaço para a nossa comunidade. Aqui vamos poder conversar sem misturar tudo em outros grupos.'
-  },
-  {
-    id: 2,
-    author: 'Rafael Lima',
-    initials: 'RL',
-    color: 'blue',
-    time: 'Hoje às 14:21',
-    text: 'Ficou muito bonito! Quando a sala de voz estiver pronta, podemos marcar a primeira chamada.'
-  },
-  {
-    id: 3,
-    author: 'Você',
-    initials: 'VC',
-    color: 'green',
-    time: 'Hoje às 14:23',
-    text: 'Combinado. Também vou colocar um canal para compartilhar projetos e ideias.'
-  }
-];
-
-const members = [
-  { name: 'Marina Costa', status: 'Organizadora', initials: 'MC', color: 'coral', online: true, presence: 'online' },
-  { name: 'Rafael Lima', status: 'Jogando Stardew Valley', initials: 'RL', color: 'blue', online: true, presence: 'idle' },
-  { name: 'Beatriz Alves', status: 'Disponível', initials: 'BA', color: 'purple', online: true, presence: 'online' },
-  { name: 'Caio Mendes', status: 'Offline há 2h', initials: 'CM', color: 'orange', online: false, presence: 'offline' },
-  { name: 'Você', status: 'Explorando o app', initials: 'VC', color: 'green', online: true, presence: 'online' }
-];
-
-const channels = [
-  { id: 'geral', label: 'geral', description: 'Conversa principal da comunidade' },
-  { id: 'projetos', label: 'projetos', description: 'Ideias, links e projetos' },
-  { id: 'memes', label: 'memes', description: 'Só conteúdo leve' }
-];
+// A instalação começa vazia. Comunidades, canais, membros e mensagens vêm do Supabase.
+const initialMessages = [];
+const members = [];
+const channels = [];
 
 const emojiOptions = ['😀', '😂', '😍', '😎', '🥳', '😢', '😡', '🤔', '👍', '👎', '👏', '🙏', '🔥', '❤️', '🎉', '🚀', '💡', '✅', '👀', '💬', '🐶', '🐱', '🍕', '☕'];
 const presenceOptions = [
@@ -140,6 +104,7 @@ function App() {
   const [microphoneStream, setMicrophoneStream] = useState(null);
   const screenPreviewRef = useRef(null);
   const [voiceJoined, setVoiceJoined] = useState(false);
+  const [voiceChannelId, setVoiceChannelId] = useState(null);
   const [voiceParticipants, setVoiceParticipants] = useState([]);
   const [showProfile, setShowProfile] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -158,6 +123,7 @@ function App() {
   const [newChannelType, setNewChannelType] = useState('text');
   const [customChannels, setCustomChannels] = useState([]);
   const [remoteChannels, setRemoteChannels] = useState([]);
+  const [remoteMembers, setRemoteMembers] = useState([]);
   const [communityId, setCommunityId] = useState(null);
   const [communityList, setCommunityList] = useState([]);
   const [mutedCommunities, setMutedCommunities] = useState(() => {
@@ -172,7 +138,10 @@ function App() {
   const [newRoleName, setNewRoleName] = useState('');
   const [newCommunityName, setNewCommunityName] = useState('');
   const [remoteReady, setRemoteReady] = useState(false);
-  const [currentRole, setCurrentRole] = useState('Organizador');
+  const [cloudLoading, setCloudLoading] = useState(false);
+  const [membershipAccessLost, setMembershipAccessLost] = useState(false);
+  const [communityReload, setCommunityReload] = useState(0);
+  const [currentRole, setCurrentRole] = useState('Membro');
   const [volumeByUser, setVolumeByUser] = useState({});
   const [localMutedUsers, setLocalMutedUsers] = useState({});
   const [localDeafenedUsers, setLocalDeafenedUsers] = useState({});
@@ -213,17 +182,71 @@ function App() {
     name: profileOverride?.name || session.user.user_metadata?.display_name || session.user.email?.split('@')[0] || 'Você',
     avatar_url: profileOverride?.avatar_url || session.user.user_metadata?.avatar_url || ''
   } : localUser;
-  const allChannels = useMemo(() => remoteChannels.length ? remoteChannels : [...channels, ...customChannels], [customChannels, remoteChannels]);
+  const allChannels = useMemo(() => remoteReady ? remoteChannels : (session?.user?.id ? [] : [...channels, ...customChannels]), [customChannels, remoteChannels, remoteReady, session?.user?.id]);
   const channel = useMemo(
-    () => allChannels.find((item) => item.id === selectedChannel) ?? allChannels[0],
+    () => allChannels.find((item) => item.id === selectedChannel) ?? allChannels[0] ?? { id: null, label: 'sem-canal', description: 'Crie ou entre em uma comunidade para começar.' },
     [allChannels, selectedChannel]
   );
   const isAdmin = communityOwnerId === activeUser?.id || ['Organizador', 'Administrador', 'Moderador'].includes(currentRole);
   const canKick = communityOwnerId === activeUser?.id || ['Organizador', 'Administrador'].includes(currentRole);
   const selectedVoiceUserIsSelf = moderationMenu?.member?.id === activeUser?.id || moderationMenu?.member?.name === activeUser?.name || moderationMenu?.member?.name === 'Você';
-  const communityRailItems = communityList.length ? communityList : [{ id: communityId || 'demo', name: communityName, owner_id: communityOwnerId, role: currentRole }];
+  const communityRailItems = communityList;
   const presenceColor = presenceStatus === 'offline' ? 'red' : presenceStatus === 'idle' ? 'gray' : 'green';
-  const displayMembers = useMemo(() => members.map((member) => member.name === 'Você' ? { ...member, presence: presenceStatus, online: presenceStatus !== 'offline', status: presenceLabel(presenceStatus) } : member), [presenceStatus]);
+  const displayMembers = useMemo(() => remoteMembers.map((member) => {
+    const isSelf = member.id === session?.user?.id;
+    const inVoice = voiceParticipants.some((participant) => participant.id === member.id);
+    const presence = isSelf ? presenceStatus : inVoice ? 'online' : 'offline';
+    return { ...member, presence, online: presence !== 'offline' };
+  }), [remoteMembers, session?.user?.id, presenceStatus, voiceParticipants]);
+
+  async function loadCommunityMembers(targetCommunityId) {
+    if (!supabase || !targetCommunityId) {
+      setRemoteMembers([]);
+      return [];
+    }
+    const { data, error } = await supabase
+      .from('community_members')
+      .select('user_id,role,profiles(id,display_name,avatar_color,avatar_url)')
+      .eq('community_id', targetCommunityId)
+      .order('joined_at', { ascending: true });
+    if (error) throw error;
+    const normalized = (data || []).map((membership) => {
+      const profile = membership.profiles || {};
+      const name = profile.display_name || 'Membro';
+      return {
+        id: membership.user_id,
+        name,
+        initials: name.slice(0, 2).toUpperCase(),
+        color: profile.avatar_color || 'blue',
+        avatar_url: profile.avatar_url || '',
+        role: membership.role || 'Membro',
+        status: membership.role || 'Membro',
+        presence: membership.user_id === session?.user?.id ? presenceStatus : 'offline',
+        online: membership.user_id === session?.user?.id && presenceStatus !== 'offline'
+      };
+    });
+    setRemoteMembers(normalized);
+    setMemberRoles(Object.fromEntries(normalized.map((member) => [member.name, member.role])));
+    return normalized;
+  }
+
+  function clearCommunityAccess(message = '') {
+    microphoneStream?.getTracks().forEach((track) => track.stop());
+    setMicrophoneStream(null);
+    setVoiceJoined(false);
+    setVoiceChannelId(null);
+    setVoiceParticipants([]);
+    setCommunityList([]);
+    setCommunityId(null);
+    setCommunityName('Sem comunidade');
+    setCommunityOwnerId(null);
+    setCurrentRole('Membro');
+    setRemoteChannels([]);
+    setRemoteMembers([]);
+    setMessages([]);
+    setRemoteReady(false);
+    if (message) showNotice(message);
+  }
 
   async function refreshAudioDevices() {
     if (!navigator.mediaDevices?.enumerateDevices) return;
@@ -322,16 +345,9 @@ function App() {
     try {
       let { data: cloudChannels, error: channelError } = await supabase.from('channels').select('id,name,type,description,position').eq('community_id', nextCommunity.id).order('position');
       if (channelError) throw channelError;
-      if (!cloudChannels?.length) {
-        const { data: createdChannels, error: createChannelError } = await supabase.from('channels').insert([
-          { community_id: nextCommunity.id, name: 'geral', type: 'text', description: 'Conversa principal da comunidade', position: 0, created_by: session.user.id },
-          { community_id: nextCommunity.id, name: 'conversa', type: 'voice', description: 'Sala de voz da comunidade', position: 1, created_by: session.user.id }
-        ]).select('id,name,type,description,position').order('position');
-        if (createChannelError) throw createChannelError;
-        cloudChannels = createdChannels || [];
-      }
-      const normalizedChannels = cloudChannels.map((item) => ({ id: item.id, label: item.name, type: item.type, description: item.description }));
+      const normalizedChannels = (cloudChannels || []).map((item) => ({ id: item.id, label: item.name, type: item.type, description: item.description }));
       setRemoteChannels(normalizedChannels);
+      await loadCommunityMembers(nextCommunity.id);
       const firstTextChannel = normalizedChannels.find((item) => item.type === 'text');
       setSelectedChannel(firstTextChannel?.id || normalizedChannels[0]?.id || 'geral');
       if (firstTextChannel) {
@@ -339,6 +355,7 @@ function App() {
         setMessages((cloudMessages || []).map((item) => ({ id: item.id, author: item.profiles?.display_name || 'Membro', initials: (item.profiles?.display_name || 'M').slice(0, 2).toUpperCase(), color: item.profiles?.avatar_color || 'blue', time: new Date(item.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }), text: item.content })));
       }
       setRemoteReady(true);
+      setMembershipAccessLost(false);
       showNotice(`Você entrou em ${nextCommunity.name}.`);
     } catch {
       setRemoteReady(false);
@@ -371,24 +388,16 @@ function App() {
           .eq('user_id', session.user.id);
         if (membershipError) throw membershipError;
 
-        let allMemberships = memberships || [];
+        const allMemberships = memberships || [];
         const savedCommunityId = localStorage.getItem(`amigos_active_community:${session.user.id}`);
-        let currentCommunityId = allMemberships.find((item) => item.community_id === savedCommunityId)?.community_id || allMemberships[0]?.community_id;
+        const currentMembership = allMemberships.find((item) => item.community_id === savedCommunityId) || allMemberships[0];
+        const currentCommunityId = currentMembership?.community_id || null;
         if (!currentCommunityId) {
-          const { data: community, error: communityError } = await supabase
-            .from('communities')
-            .insert({ name: 'Amigos', owner_id: session.user.id })
-            .select('id,name,owner_id')
-            .single();
-          if (communityError) throw communityError;
-          currentCommunityId = community.id;
-          const { error: memberError } = await supabase.from('community_members').insert({
-            community_id: currentCommunityId,
-            user_id: session.user.id,
-            role: 'Organizador'
-          });
-          if (memberError) throw memberError;
-          allMemberships = [{ community_id: currentCommunityId, role: 'Organizador' }];
+          if (!alive) return;
+          setCloudLoading(false);
+          clearCommunityAccess();
+          setMembershipAccessLost(false);
+          return;
         }
         const communityIds = allMemberships.map((item) => item.community_id);
         const { data: communityInfos, error: communityInfoError } = await supabase.from('communities').select('id,name,owner_id').in('id', communityIds);
@@ -410,24 +419,13 @@ function App() {
           .eq('community_id', currentCommunityId)
           .order('position');
         if (channelError) throw channelError;
-        if (!cloudChannels?.length) {
-          const { data: createdChannels, error: createChannelError } = await supabase
-            .from('channels')
-            .insert([
-              { community_id: currentCommunityId, name: 'geral', type: 'text', description: 'Conversa principal da comunidade', position: 0, created_by: session.user.id },
-              { community_id: currentCommunityId, name: 'conversa', type: 'voice', description: 'Sala de voz da comunidade', position: 1, created_by: session.user.id }
-            ])
-            .select('id,name,type,description,position')
-            .order('position');
-          if (createChannelError) throw createChannelError;
-          cloudChannels = createdChannels || [];
-        }
-
         if (!alive) return;
-        const normalizedChannels = cloudChannels.map((item) => ({ id: item.id, label: item.name, type: item.type, description: item.description }));
+        const normalizedChannels = (cloudChannels || []).map((item) => ({ id: item.id, label: item.name, type: item.type, description: item.description }));
         setCommunityId(currentCommunityId);
-        setCurrentRole(membership?.role || 'Membro');
+        setCurrentRole(currentMembership?.role || 'Membro');
+        setMembershipAccessLost(false);
         setRemoteChannels(normalizedChannels);
+        await loadCommunityMembers(currentCommunityId);
         setSelectedChannel(normalizedChannels[0]?.id || 'geral');
         setRemoteReady(true);
 
@@ -463,20 +461,62 @@ function App() {
 
     loadCloudCommunity();
     return () => { alive = false; };
-  }, [session?.user?.id]);
+  }, [session?.user?.id, communityReload]);
+
+  useEffect(() => {
+    if (!supabase || !session?.user?.id || !communityId) return undefined;
+    let active = true;
+    const verifyMembership = async () => {
+      const { data: ownMembership } = await supabase
+        .from('community_members')
+        .select('community_id,role')
+        .eq('community_id', communityId)
+        .eq('user_id', session.user.id)
+        .maybeSingle();
+      if (!active) return;
+      if (!ownMembership) {
+        clearCommunityAccess('Você não faz mais parte desta comunidade.');
+        return;
+      }
+      setCurrentRole(ownMembership.role || 'Membro');
+      try { await loadCommunityMembers(communityId); } catch { /* próxima verificação tentará novamente */ }
+    };
+    const communitySync = supabase.channel(`community-sync:${communityId}:${session.user.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'community_members', filter: `community_id=eq.${communityId}` }, verifyMembership)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'channels', filter: `community_id=eq.${communityId}` }, async () => {
+        const { data } = await supabase.from('channels').select('id,name,type,description,position').eq('community_id', communityId).order('position');
+        if (active) setRemoteChannels((data || []).map((item) => ({ id: item.id, label: item.name, type: item.type, description: item.description })));
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'communities', filter: `id=eq.${communityId}` }, (payload) => {
+        if (active && payload.new?.name) {
+          setCommunityName(payload.new.name);
+          setCommunityList((current) => current.map((item) => item.id === communityId ? { ...item, name: payload.new.name } : item));
+        }
+      })
+      .subscribe();
+    const membershipTimer = window.setInterval(verifyMembership, 15000);
+    verifyMembership();
+    return () => {
+      active = false;
+      window.clearInterval(membershipTimer);
+      supabase.removeChannel(communitySync);
+    };
+  }, [communityId, session?.user?.id]);
 
   useEffect(() => {
     if (!supabase || !remoteReady || !session?.user?.id || !channel?.id || channel.type !== 'text') return undefined;
     const messageChannel = supabase.channel(`messages:${channel.id}`)
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel_id=eq.${channel.id}` }, (payload) => {
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `channel_id=eq.${channel.id}` }, async (payload) => {
         const next = payload.new;
+        const { data: authorProfile } = await supabase.from('profiles').select('display_name,avatar_color').eq('id', next.author_id).maybeSingle();
         setMessages((current) => {
           if (current.some((item) => item.id === next.id)) return current;
+          const author = authorProfile?.display_name || (next.author_id === session.user.id ? (activeUser?.name || 'Você') : 'Membro');
           return [...current, {
             id: next.id,
-            author: next.author_id === session.user.id ? (activeUser?.name || 'Você') : 'Membro',
-            initials: next.author_id === session.user.id ? 'VC' : 'MB',
-            color: next.author_id === session.user.id ? 'green' : 'blue',
+            author,
+            initials: author.slice(0, 2).toUpperCase(),
+            color: authorProfile?.avatar_color || (next.author_id === session.user.id ? 'green' : 'blue'),
             time: new Date(next.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
             text: next.content,
             type: next.message_type || 'text',
@@ -496,21 +536,22 @@ function App() {
       setVoiceParticipants([]);
       return undefined;
     }
-    const voiceChannel = supabase.channel(`voice:${communityId || 'community'}`, {
+    const activeVoiceChannelId = voiceChannelId || channel?.id || 'voice-default';
+    const voiceChannel = supabase.channel(`voice:${communityId || 'community'}:${activeVoiceChannelId}`, {
       config: { presence: { key: session.user.id } }
     });
     voiceChannelRef.current = voiceChannel;
     voiceChannel.on('presence', { event: 'sync' }, () => {
       const state = voiceChannel.presenceState();
-      const participants = Object.values(state).flat().map((item) => item.user).filter(Boolean);
+      const participants = Object.values(state).flat().map((item) => item.user).filter((user) => user && (!user.voice_channel_id || user.voice_channel_id === activeVoiceChannelId));
       setVoiceParticipants(participants);
     }).subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
-        await voiceChannel.track({ user: { id: session.user.id, name: activeUser?.name || 'Você', initials: (activeUser?.name || 'VC').slice(0, 2).toUpperCase(), color: 'green', avatar_url: activeUser?.avatar_url || '', speaking: false } });
+        await voiceChannel.track({ user: { id: session.user.id, name: activeUser?.name || 'Você', initials: (activeUser?.name || 'VC').slice(0, 2).toUpperCase(), color: 'green', avatar_url: activeUser?.avatar_url || '', voice_channel_id: activeVoiceChannelId, speaking: false } });
       }
     });
     return () => { supabase.removeChannel(voiceChannel); voiceChannelRef.current = null; setVoiceParticipants([]); };
-  }, [remoteReady, voiceJoined, communityId, session?.user?.id, activeUser?.name, activeUser?.avatar_url]);
+  }, [remoteReady, voiceJoined, voiceChannelId, communityId, channel?.id, session?.user?.id, activeUser?.name, activeUser?.avatar_url]);
 
   useEffect(() => {
     if (!voiceJoined || !microphoneStream) {
@@ -541,7 +582,7 @@ function App() {
       if (speaking !== lastSpeaking) {
         lastSpeaking = speaking;
         setVoiceSpeaking(speaking);
-        const nextUser = { id: session?.user?.id, name: activeUser?.name || 'Você', initials: (activeUser?.name || 'VC').slice(0, 2).toUpperCase(), color: 'green', avatar_url: activeUser?.avatar_url || '', speaking };
+        const nextUser = { id: session?.user?.id, name: activeUser?.name || 'Você', initials: (activeUser?.name || 'VC').slice(0, 2).toUpperCase(), color: 'green', avatar_url: activeUser?.avatar_url || '', voice_channel_id: voiceChannelId || channel?.id || 'voice-default', speaking };
         voiceChannelRef.current?.track({ user: nextUser });
       }
       frame = requestAnimationFrame(detect);
@@ -554,9 +595,9 @@ function App() {
       analyser.disconnect();
       audioContext.close().catch(() => {});
       setVoiceSpeaking(false);
-      voiceChannelRef.current?.track({ user: { id: session?.user?.id, name: activeUser?.name || 'Você', initials: (activeUser?.name || 'VC').slice(0, 2).toUpperCase(), color: 'green', avatar_url: activeUser?.avatar_url || '', speaking: false } });
+          voiceChannelRef.current?.track({ user: { id: session?.user?.id, name: activeUser?.name || 'Você', initials: (activeUser?.name || 'VC').slice(0, 2).toUpperCase(), color: 'green', avatar_url: activeUser?.avatar_url || '', voice_channel_id: voiceChannelId || channel?.id || 'voice-default', speaking: false } });
     };
-  }, [voiceJoined, microphoneStream, muted, deafened, micSensitivity, session?.user?.id, activeUser?.name, activeUser?.avatar_url]);
+  }, [voiceJoined, microphoneStream, muted, deafened, micSensitivity, voiceChannelId, channel?.id, session?.user?.id, activeUser?.name, activeUser?.avatar_url]);
 
   useEffect(() => {
     if (!screenPreviewRef.current || !screenStream) return undefined;
@@ -565,22 +606,38 @@ function App() {
     return () => { if (screenPreviewRef.current) screenPreviewRef.current.srcObject = null; };
   }, [screenStream]);
 
+  async function refreshSocialData() {
+    if (!supabase || !session?.user?.id) return;
+    const { data: relations, error } = await supabase
+      .from('friendships')
+      .select('id,status,requester_id,addressee_id,created_at,updated_at')
+      .or(`requester_id.eq.${session.user.id},addressee_id.eq.${session.user.id}`)
+      .order('updated_at', { ascending: false });
+    if (error || !relations) return;
+    const ids = [...new Set(relations.flatMap((item) => [item.requester_id, item.addressee_id]))];
+    const { data: profiles } = await supabase.from('profiles').select('id,display_name,avatar_color,avatar_url').in('id', ids);
+    const byId = Object.fromEntries((profiles || []).map((profile) => [profile.id, profile]));
+    const withProfiles = relations.map((item) => ({
+      ...item,
+      other: byId[item.requester_id === session.user.id ? item.addressee_id : item.requester_id] || { display_name: 'Membro' }
+    }));
+    setFriendsList(withProfiles.filter((item) => item.status === 'accepted'));
+    setFriendRequests(withProfiles.filter((item) => item.status === 'pending' && item.addressee_id === session.user.id));
+  }
+
   useEffect(() => {
     if (!supabase || !session?.user?.id) return undefined;
     let active = true;
-    async function loadSocial() {
-      const { data: relations } = await supabase.from('friendships').select('id,status,requester_id,addressee_id').or(`requester_id.eq.${session.user.id},addressee_id.eq.${session.user.id}`);
-      if (!active || !relations) return;
-      const ids = [...new Set(relations.flatMap((item) => [item.requester_id, item.addressee_id]))];
-      const { data: profiles } = await supabase.from('profiles').select('id,display_name,avatar_color').in('id', ids);
-      const byId = Object.fromEntries((profiles || []).map((profile) => [profile.id, profile]));
-      const withProfiles = relations.map((item) => ({ ...item, other: byId[item.requester_id === session.user.id ? item.addressee_id : item.requester_id] || { display_name: 'Membro' } }));
-      if (!active) return;
-      setFriendsList(withProfiles.filter((item) => item.status === 'accepted'));
-      setFriendRequests(withProfiles.filter((item) => item.status === 'pending' && item.addressee_id === session.user.id));
-    }
-    loadSocial();
-    return () => { active = false; };
+    refreshSocialData();
+    const socialChannel = supabase.channel(`friendships:${session.user.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => {
+        if (active) refreshSocialData();
+      })
+      .subscribe();
+    return () => {
+      active = false;
+      supabase.removeChannel(socialChannel);
+    };
   }, [session?.user?.id]);
 
   async function sendFriendRequest() {
@@ -595,16 +652,33 @@ function App() {
       setFriendStatus('Nenhum usuário encontrado com esse nome exato.');
       return;
     }
+    if (profile.id === session.user.id) {
+      setFriendStatus('Você não pode enviar uma solicitação para si mesmo.');
+      return;
+    }
+    const { data: existing } = await supabase.from('friendships').select('id,status,requester_id,addressee_id').or(`and(requester_id.eq.${session.user.id},addressee_id.eq.${profile.id}),and(requester_id.eq.${profile.id},addressee_id.eq.${session.user.id})`).maybeSingle();
+    if (existing?.status === 'accepted') {
+      setFriendStatus(`${profile.display_name} já está na sua lista de amigos.`);
+      return;
+    }
+    if (existing?.status === 'pending') {
+      setFriendStatus('Já existe uma solicitação pendente entre vocês.');
+      return;
+    }
     const { error } = await supabase.from('friendships').insert({ requester_id: session.user.id, addressee_id: profile.id });
-    setFriendStatus(error ? 'Não foi possível enviar a solicitação; talvez ela já exista.' : `Solicitação enviada para ${profile.display_name}.`);
-    if (!error) setFriendSearch('');
+    setFriendStatus(error ? `Não foi possível enviar a solicitação: ${error.message}` : `Solicitação enviada para ${profile.display_name}.`);
+    if (!error) { setFriendSearch(''); await refreshSocialData(); }
   }
 
   async function respondToFriendRequest(request, status) {
-    if (!supabase) return;
-    await supabase.from('friendships').update({ status, updated_at: new Date().toISOString() }).eq('id', request.id);
-    setFriendRequests((current) => current.filter((item) => item.id !== request.id));
-    if (status === 'accepted') setFriendsList((current) => [...current, { ...request, status }]);
+    if (!supabase || !session?.user?.id) return;
+    const { error } = await supabase.from('friendships').update({ status, updated_at: new Date().toISOString() }).eq('id', request.id).eq('addressee_id', session.user.id);
+    if (error) {
+      setFriendStatus(`Não foi possível atualizar a solicitação: ${error.message}`);
+      return;
+    }
+    await refreshSocialData();
+    setFriendStatus(status === 'accepted' ? `Agora você e ${request.other?.display_name || 'seu amigo'} são amigos.` : 'Solicitação recusada.');
   }
 
   async function createCommunityInvite() {
@@ -623,21 +697,17 @@ function App() {
   }
 
   async function acceptCommunityInvite() {
-    const code = inviteCode.trim();
+    const code = inviteCode.trim().toUpperCase();
     if (!supabase || !session?.user?.id || !code) return;
-    const { data: invite, error } = await supabase.from('community_invites').select('id,community_id,status,expires_at').eq('invite_code', code).eq('status', 'pending').maybeSingle();
-    if (error || !invite || new Date(invite.expires_at) < new Date()) {
-      setFriendStatus('Convite inválido ou expirado.');
+    const { data, error } = await supabase.rpc('redeem_community_invite', { input_code: code });
+    if (error || !data?.length) {
+      setFriendStatus(error?.message?.includes('expirado') ? 'Convite inválido ou expirado.' : 'Não foi possível aceitar esse convite. Confira o código e tente novamente.');
       return;
     }
-    const { error: memberError } = await supabase.from('community_members').upsert({ community_id: invite.community_id, user_id: session.user.id, role: 'Membro' });
-    if (memberError) {
-      setFriendStatus('Não foi possível entrar nessa comunidade.');
-      return;
-    }
-    await supabase.from('community_invites').update({ status: 'accepted' }).eq('id', invite.id);
     setFriendStatus('Você entrou na comunidade pelo convite.');
     setInviteCode('');
+    setCommunityReload((current) => current + 1);
+    setShowInvite(false);
   }
 
   async function submitAuth(event) {
@@ -716,15 +786,27 @@ function App() {
     setVoiceJoined(false);
   }
 
-  async function toggleVoice() {
-    if (voiceJoined) {
+  async function toggleVoice(targetChannelId = null) {
+    const requestedChannelId = targetChannelId || allChannels.find((item) => item.type === 'voice')?.id || channel?.id;
+    if (!requestedChannelId) {
+      showNotice('Esta comunidade ainda não possui uma sala de voz.');
+      return;
+    }
+    if (voiceJoined && voiceChannelId === requestedChannelId) {
       microphoneStream?.getTracks().forEach((track) => track.stop());
       setMicrophoneStream(null);
       setVoiceJoined(false);
+      setVoiceChannelId(null);
       playVoiceTone('leave');
-      setNotice('Você saiu de #conversa.');
+      setNotice('Você saiu da sala de voz.');
       window.setTimeout(() => setNotice(''), 2600);
       return;
+    }
+    if (voiceJoined && voiceChannelId !== requestedChannelId) {
+      microphoneStream?.getTracks().forEach((track) => track.stop());
+      setMicrophoneStream(null);
+      setVoiceJoined(false);
+      setVoiceChannelId(null);
     }
     try {
       const audio = await navigator.mediaDevices.getUserMedia({ audio: selectedInput !== 'default' ? { deviceId: { exact: selectedInput } } : true });
@@ -733,9 +815,10 @@ function App() {
       showNotice('Não foi possível acessar o microfone selecionado.');
       return;
     }
+    setVoiceChannelId(requestedChannelId);
     setVoiceJoined(true);
     playVoiceTone('join');
-    setNotice('Você entrou em #conversa.');
+    setNotice(`Você entrou em ${allChannels.find((item) => item.id === requestedChannelId)?.label || 'sala de voz'}.`);
     window.setTimeout(() => setNotice(''), 2600);
   }
 
@@ -1162,7 +1245,7 @@ function App() {
             </button>
           ))}
           <div className="sidebar-section-title voice-title"><span>CANAIS DE VOZ</span><button onClick={() => { setNewChannelType('voice'); setShowChannelCreator(true); }} title="Criar sala de voz"><Plus size={16} /></button></div>
-          {allChannels.filter((item) => item.type === 'voice').map((item) => <button key={item.id} className={`channel-row voice-channel ${voiceJoined ? 'voice-connected' : ''}`} onClick={toggleVoice} onContextMenu={(event) => { event.preventDefault(); setChannelMenu({ x: event.clientX, y: event.clientY, item }); }} title={item.description}><Volume2 size={19} /><span>{item.label}</span>{voiceJoined && <span className="voice-state">conectado</span>}</button>)}
+          {allChannels.filter((item) => item.type === 'voice').map((item) => <button key={item.id} className={`channel-row voice-channel ${voiceJoined && voiceChannelId === item.id ? 'voice-connected' : ''}`} onClick={() => toggleVoice(item.id)} onContextMenu={(event) => { event.preventDefault(); setChannelMenu({ x: event.clientX, y: event.clientY, item }); }} title={item.description}><Volume2 size={19} /><span>{item.label}</span>{voiceJoined && voiceChannelId === item.id && <span className="voice-state">conectado</span>}</button>)}
           <div className={`voice-preview ${voiceJoined ? 'voice-preview-connected' : ''}`}>
             <div className="voice-preview-title"><span className="pulse-dot" /> {voiceJoined ? 'Voz conectada' : 'Voz disponível'}</div>
             <p>{voiceJoined ? 'Você está visível para a comunidade nesta sala.' : 'Entre para conversar com os seus amigos.'}</p>
@@ -1174,12 +1257,12 @@ function App() {
               const isSpeaking = Boolean(participant.speaking || (isSelf && voiceSpeaking));
               return <div className={`voice-participant ${isSelf ? 'voice-participant-self' : ''} ${isSpeaking ? 'voice-participant-speaking' : ''}`} key={participant.id || participantName} title="Botão direito para opções de voz" onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setModerationMenu({ x: event.clientX, y: event.clientY, member: { id: participant.id, name: participantName, initials: participant.initials || 'MB', color: participant.color || 'blue', online: true } }); }}><Avatar initials={participant.initials || 'MB'} color={participant.color || 'blue'} online small image={isSelf ? activeUser?.avatar_url : participant.avatar_url} speaking={isSpeaking} /><span className="voice-participant-copy"><strong>{participantName} {isSelf && <em className="you-badge">você</em>}</strong><small>{isDeafened ? 'ensurdecido' : isMuted ? 'mutado' : 'conectado agora'}</small></span><span className="voice-indicators">{isMuted && <span className="voice-badge muted" title="Microfone mutado"><MicOff size={12} /></span>}{isDeafened && <span className="voice-badge deafened" title="Áudio ensurdecido"><Headphones size={12} /></span>}</span></div>;
             })}
-            <button onClick={toggleVoice}><PhoneCall size={15} /> {voiceJoined ? 'Sair da sala' : 'Entrar agora'}</button>
+            <button onClick={() => toggleVoice(voiceChannelId || allChannels.find((item) => item.type === 'voice')?.id)}><PhoneCall size={15} /> {voiceJoined ? 'Sair da sala' : 'Entrar agora'}</button>
           </div>
         </div>
         <div className="voice-controls">
           <div className="voice-control-status"><span className={voiceJoined ? 'pulse-dot' : 'muted-dot'} /> <div><strong>{voiceJoined ? 'conversa' : 'Voz desligada'}</strong><small>{voiceJoined ? 'conectado' : 'entre em uma sala'}</small></div></div>
-          <div className="voice-control-actions"><button onClick={() => { if (!voiceJoined) toggleVoice(); setMuted(!muted); }} className={muted ? 'dock-active' : ''} title={muted ? 'Ativar microfone' : 'Silenciar microfone'}>{muted ? <MicOff size={17} /> : <Mic size={17} />}</button><button onClick={toggleShare} className={sharing ? 'dock-active share-active' : ''} title={sharing ? 'Parar compartilhamento' : 'Compartilhar tela'}><MonitorUp size={17} /></button><button onClick={() => showNotice('Câmera disponível em breve.')} title="Ativar câmera"><Video size={17} /></button><button className="end-call" onClick={() => { if (voiceJoined) toggleVoice(); else showNotice('Você não está em uma sala de voz.'); }} title="Desconectar"><PhoneCall size={17} /></button></div>
+          <div className="voice-control-actions"><button onClick={() => { if (!voiceJoined) toggleVoice(voiceChannelId); setMuted(!muted); }} className={muted ? 'dock-active' : ''} title={muted ? 'Ativar microfone' : 'Silenciar microfone'}>{muted ? <MicOff size={17} /> : <Mic size={17} />}</button><button onClick={toggleShare} className={sharing ? 'dock-active share-active' : ''} title={sharing ? 'Parar compartilhamento' : 'Compartilhar tela'}><MonitorUp size={17} /></button><button onClick={() => showNotice('Câmera disponível em breve.')} title="Ativar câmera"><Video size={17} /></button><button className="end-call" onClick={() => { if (voiceJoined) toggleVoice(voiceChannelId); else showNotice('Você não está em uma sala de voz.'); }} title="Desconectar"><PhoneCall size={17} /></button></div>
         </div>
         <div className="profile-bar">
           <button className="profile-summary" onClick={() => setShowProfile(true)}>
