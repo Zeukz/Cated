@@ -806,7 +806,11 @@ function App() {
   async function sendCommunityFriendInvite(friend) {
     const friendId = friend?.other?.id || friend?.id;
     if (!supabase || !session?.user?.id || !communityId || !friendId) return;
-    const { error } = await supabase.rpc('send_community_friend_invite', { target_community: communityId, target_friend: friendId });
+    let { error } = await supabase.rpc('send_community_friend_invite', { target_community: communityId, target_friend: friendId });
+    if (error) {
+      const fallback = await supabase.from('community_friend_invites').insert({ community_id: communityId, inviter_id: session.user.id, invitee_id: friendId, status: 'pending' }).select('id').single();
+      error = fallback.error;
+    }
     if (error) {
       setCommunityFriendInviteStatus(`Não foi possível convidar ${friend?.other?.display_name || 'este amigo'}: ${error.message}`);
       return;

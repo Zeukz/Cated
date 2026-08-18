@@ -101,3 +101,6 @@ end;
 $$;
 
 grant execute on function public.send_direct_message(uuid, text) to authenticated;
+
+
+notify pgrst, 'reload schema';
