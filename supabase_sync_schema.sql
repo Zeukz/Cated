@@ -20,7 +20,7 @@ begin
     into invite_row
     from public.community_invites ci
    where upper(trim(ci.invite_code)) = upper(trim(input_code))
-     and ci.status = 'pending'
+     and ci.status in ('pending', 'accepted')
      and ci.expires_at > now()
    order by ci.created_at desc
    limit 1;

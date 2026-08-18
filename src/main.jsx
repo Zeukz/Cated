@@ -8,6 +8,7 @@ import {
   Hash,
   HelpCircle,
   LogOut,
+  MessageCircle,
   Mic,
   MicOff,
   MonitorUp,
@@ -33,6 +34,10 @@ import { isSupabaseConfigured, supabase } from './supabase';
 const initialMessages = [];
 const members = [];
 const channels = [];
+const rtcIceServers = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  ...(import.meta.env.VITE_TURN_URL ? [{ urls: import.meta.env.VITE_TURN_URL, username: import.meta.env.VITE_TURN_USERNAME || '', credential: import.meta.env.VITE_TURN_CREDENTIAL || '' }] : [])
+];
 
 const emojiOptions = ['😀', '😂', '😍', '😎', '🥳', '😢', '😡', '🤔', '👍', '👎', '👏', '🙏', '🔥', '❤️', '🎉', '🚀', '💡', '✅', '👀', '💬', '🐶', '🐱', '🍕', '☕'];
 const presenceOptions = [
@@ -78,6 +83,9 @@ function Avatar({ initials, color, online = false, small = false, image = '', pr
 
 function App() {
   const [selectedChannel, setSelectedChannel] = useState('geral');
+  const [viewMode, setViewMode] = useState('community');
+  const [selectedFriend, setSelectedFriend] = useState(null);
+  const [directMessages, setDirectMessages] = useState([]);
   const [messages, setMessages] = useState(initialMessages);
   const [draft, setDraft] = useState('');
   const [recordingAudio, setRecordingAudio] = useState(false);
@@ -106,6 +114,9 @@ function App() {
   const [voiceJoined, setVoiceJoined] = useState(false);
   const [voiceChannelId, setVoiceChannelId] = useState(null);
   const [voiceParticipants, setVoiceParticipants] = useState([]);
+  const rtcPeersRef = useRef({});
+  const rtcAudioRef = useRef({});
+  const [rtcReady, setRtcReady] = useState(false);
   const [showProfile, setShowProfile] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showFriends, setShowFriends] = useState(false);
@@ -328,8 +339,11 @@ function App() {
   }
 
   async function switchCommunity(nextCommunity) {
-    if (!nextCommunity?.id || nextCommunity.id === communityId || !supabase || !session?.user?.id) return;
+    if (!nextCommunity?.id || !supabase || !session?.user?.id) return;
+    setViewMode('community');
+    if (nextCommunity.id === communityId) return;
     setVoiceJoined(false);
+    setVoiceChannelId(null);
     microphoneStream?.getTracks().forEach((track) => track.stop());
     setMicrophoneStream(null);
     setModerationMenu(null);
@@ -534,6 +548,11 @@ function App() {
     if (!supabase || !remoteReady || !voiceJoined || !session?.user?.id) {
       voiceChannelRef.current = null;
       setVoiceParticipants([]);
+      setRtcReady(false);
+      Object.values(rtcPeersRef.current).forEach((peer) => peer.close());
+      rtcPeersRef.current = {};
+      Object.values(rtcAudioRef.current).forEach((audio) => audio.remove());
+      rtcAudioRef.current = {};
       return undefined;
     }
     const activeVoiceChannelId = voiceChannelId || channel?.id || 'voice-default';
@@ -541,17 +560,88 @@ function App() {
       config: { presence: { key: session.user.id } }
     });
     voiceChannelRef.current = voiceChannel;
+
+    const sendSignal = (target, signal) => voiceChannel.send({ type: 'broadcast', event: 'webrtc-signal', payload: { target, sender: session.user.id, signal } });
+    const closePeer = (peerId) => {
+      rtcPeersRef.current[peerId]?.close();
+      delete rtcPeersRef.current[peerId];
+      rtcAudioRef.current[peerId]?.remove();
+      delete rtcAudioRef.current[peerId];
+    };
+    const ensurePeer = (peerId, initiator = false) => {
+      if (!peerId || peerId === session.user.id) return null;
+      if (rtcPeersRef.current[peerId]) return rtcPeersRef.current[peerId];
+      const peer = new RTCPeerConnection({ iceServers: rtcIceServers });
+      rtcPeersRef.current[peerId] = peer;
+      microphoneStream?.getTracks().forEach((track) => peer.addTrack(track, microphoneStream));
+      peer.onicecandidate = (event) => { if (event.candidate) sendSignal(peerId, { type: 'candidate', candidate: event.candidate }); };
+      peer.ontrack = (event) => {
+        const [stream] = event.streams;
+        if (!stream) return;
+        let audio = rtcAudioRef.current[peerId];
+        if (!audio) {
+          audio = document.createElement('audio');
+          audio.autoplay = true;
+          audio.playsInline = true;
+          audio.dataset.peerId = peerId;
+          document.body.appendChild(audio);
+          rtcAudioRef.current[peerId] = audio;
+        }
+        audio.srcObject = stream;
+        audio.volume = deafened ? 0 : Math.max(0, Math.min(100, masterVolume)) / 100;
+        if (audio.setSinkId && selectedOutput !== 'default') audio.setSinkId(selectedOutput).catch(() => {});
+        audio.play().catch(() => {});
+      };
+      peer.onconnectionstatechange = () => { if (['failed', 'closed', 'disconnected'].includes(peer.connectionState)) closePeer(peerId); };
+      if (initiator) peer.createOffer().then((offer) => peer.setLocalDescription(offer).then(() => sendSignal(peerId, { type: 'offer', offer }))).catch(() => {});
+      return peer;
+    };
+
     voiceChannel.on('presence', { event: 'sync' }, () => {
       const state = voiceChannel.presenceState();
       const participants = Object.values(state).flat().map((item) => item.user).filter((user) => user && (!user.voice_channel_id || user.voice_channel_id === activeVoiceChannelId));
       setVoiceParticipants(participants);
-    }).subscribe(async (status) => {
+      participants.filter((user) => user.id !== session.user.id).forEach((user) => {
+        if (session.user.id < user.id) ensurePeer(user.id, true);
+      });
+    });
+    voiceChannel.on('presence', { event: 'leave' }, ({ leftPresences }) => {
+      (leftPresences || []).map((presence) => presence.user?.id).filter(Boolean).forEach(closePeer);
+    });
+    voiceChannel.on('broadcast', { event: 'webrtc-signal' }, async ({ payload }) => {
+      if (!payload || payload.target !== session.user.id || payload.sender === session.user.id) return;
+      const peer = ensurePeer(payload.sender, false);
+      if (!peer) return;
+      try {
+        if (payload.signal.type === 'offer') {
+          await peer.setRemoteDescription(payload.signal.offer);
+          const answer = await peer.createAnswer();
+          await peer.setLocalDescription(answer);
+          sendSignal(payload.sender, { type: 'answer', answer });
+        } else if (payload.signal.type === 'answer') {
+          await peer.setRemoteDescription(payload.signal.answer);
+        } else if (payload.signal.type === 'candidate') {
+          await peer.addIceCandidate(payload.signal.candidate);
+        }
+      } catch { closePeer(payload.sender); }
+    });
+    voiceChannel.subscribe(async (status) => {
       if (status === 'SUBSCRIBED') {
         await voiceChannel.track({ user: { id: session.user.id, name: activeUser?.name || 'Você', initials: (activeUser?.name || 'VC').slice(0, 2).toUpperCase(), color: 'green', avatar_url: activeUser?.avatar_url || '', voice_channel_id: activeVoiceChannelId, speaking: false } });
+        setRtcReady(true);
       }
     });
-    return () => { supabase.removeChannel(voiceChannel); voiceChannelRef.current = null; setVoiceParticipants([]); };
-  }, [remoteReady, voiceJoined, voiceChannelId, communityId, channel?.id, session?.user?.id, activeUser?.name, activeUser?.avatar_url]);
+    return () => {
+      Object.values(rtcPeersRef.current).forEach((peer) => peer.close());
+      rtcPeersRef.current = {};
+      Object.values(rtcAudioRef.current).forEach((audio) => audio.remove());
+      rtcAudioRef.current = {};
+      supabase.removeChannel(voiceChannel);
+      voiceChannelRef.current = null;
+      setVoiceParticipants([]);
+      setRtcReady(false);
+    };
+  }, [remoteReady, voiceJoined, voiceChannelId, communityId, channel?.id, session?.user?.id, activeUser?.name, activeUser?.avatar_url, microphoneStream]);
 
   useEffect(() => {
     if (!voiceJoined || !microphoneStream) {
@@ -680,6 +770,55 @@ function App() {
     await refreshSocialData();
     setFriendStatus(status === 'accepted' ? `Agora você e ${request.other?.display_name || 'seu amigo'} são amigos.` : 'Solicitação recusada.');
   }
+
+  function openLobby() {
+    setViewMode('lobby');
+    setSelectedFriend(null);
+    setDraft('');
+  }
+
+  async function openDirectChat(friend) {
+    const friendId = friend?.other?.id || friend?.id;
+    if (!friendId || !session?.user?.id || !supabase) return;
+    setSelectedFriend(friend);
+    setViewMode('dm');
+    setDraft('');
+    const { data } = await supabase
+      .from('direct_messages')
+      .select('id,sender_id,recipient_id,content,created_at')
+      .or(`and(sender_id.eq.${session.user.id},recipient_id.eq.${friendId}),and(sender_id.eq.${friendId},recipient_id.eq.${session.user.id})`)
+      .order('created_at', { ascending: true })
+      .limit(200);
+    setDirectMessages(data || []);
+  }
+
+  async function sendDirectMessage(event) {
+    event.preventDefault();
+    const content = draft.trim();
+    const friendId = selectedFriend?.other?.id || selectedFriend?.id;
+    if (!content || !friendId || !supabase || !session?.user?.id) return;
+    const { data, error } = await supabase.from('direct_messages').insert({ sender_id: session.user.id, recipient_id: friendId, content }).select('id,sender_id,recipient_id,content,created_at').single();
+    if (error) {
+      showNotice('Não foi possível enviar a mensagem privada. Aceite a amizade e tente novamente.');
+      return;
+    }
+    setDirectMessages((current) => current.some((item) => item.id === data.id) ? current : [...current, data]);
+    setDraft('');
+  }
+
+  useEffect(() => {
+    const friendId = selectedFriend?.other?.id || selectedFriend?.id;
+    if (!supabase || viewMode !== 'dm' || !session?.user?.id || !friendId) return undefined;
+    const directChannel = supabase.channel(`direct-messages:${session.user.id}:${friendId}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'direct_messages' }, (payload) => {
+        const next = payload.new;
+        if ((next.sender_id === session.user.id && next.recipient_id === friendId) || (next.sender_id === friendId && next.recipient_id === session.user.id)) {
+          setDirectMessages((current) => current.some((item) => item.id === next.id) ? current : [...current, next]);
+        }
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(directChannel); };
+  }, [viewMode, selectedFriend?.other?.id, selectedFriend?.id, session?.user?.id]);
 
   async function createCommunityInvite() {
     if (!supabase || !communityId || !session?.user?.id) {
@@ -1212,12 +1351,20 @@ function App() {
     />;
   }
 
+  if (viewMode === 'lobby') {
+    return <LobbyScreen activeUser={activeUser} friends={friendsList} requests={friendRequests} search={friendSearch} setSearch={setFriendSearch} onSearch={sendFriendRequest} onRespond={respondToFriendRequest} onOpenFriend={openDirectChat} communities={communityRailItems} currentCommunityId={communityId} onCommunity={(item) => { setViewMode('community'); switchCommunity(item); }} onCreateCommunity={() => setShowCommunityCreator(true)} />;
+  }
+
+  if (viewMode === 'dm') {
+    return <DirectChatScreen activeUser={activeUser} friend={selectedFriend} messages={directMessages} draft={draft} setDraft={setDraft} onSubmit={sendDirectMessage} onBack={openLobby} communities={communityRailItems} currentCommunityId={communityId} onCommunity={(item) => { setViewMode('community'); switchCommunity(item); }} onCreateCommunity={() => setShowCommunityCreator(true)} />;
+  }
+
   return (
     <div className="app-shell">
       <aside className="server-rail">
-        <div className="brand-mark" title="Amigos">
+        <button className="brand-mark" title="Lobby de amizades" onClick={openLobby}>
           <span>A</span>
-        </div>
+        </button>
         <div className="rail-divider" />
         <div className="community-rail-list">{communityRailItems.map((community) => <button key={community.id} className={`server-icon ${community.id === communityId ? 'active' : ''} ${mutedCommunities[community.id] ? 'community-muted' : ''}`} onClick={() => switchCommunity(community)} onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); setCommunityMenu({ x: event.clientX, y: event.clientY, community }); }} title={`${community.name}${community.id === communityId ? ' · atual' : ''}${mutedCommunities[community.id] ? ' · silenciada' : ''}`}><span>{mutedCommunities[community.id] ? <VolumeX size={18} /> : community.name.slice(0, 2).toUpperCase()}</span></button>)}</div>
         <button className="server-icon add-server" onClick={() => setShowCommunityCreator(true)} title="Criar nova comunidade"><Plus size={21} /></button>
@@ -1411,6 +1558,38 @@ function ModerationMenu({ x, y, member, admin, canKick, self, onAction, onClose 
     ] : [])
   ];
   return <ContextMenu x={x} y={y} items={items} onClose={onClose} />;
+}
+
+function LobbyScreen({ activeUser, friends, requests, search, setSearch, onSearch, onRespond, onOpenFriend, communities, currentCommunityId, onCommunity, onCreateCommunity }) {
+  return <div className="app-shell">
+    <aside className="server-rail">
+      <button className="brand-mark" title="Lobby de amizades"><span>A</span></button>
+      <div className="rail-divider" />
+      <div className="community-rail-list"><button className="server-icon active" title="Lobby de amizades"><Users size={18} /></button>{communities.map((community) => <button key={community.id} className={`server-icon ${community.id === currentCommunityId ? 'active' : ''}`} onClick={() => onCommunity(community)} title={community.name}><span>{community.name.slice(0, 2).toUpperCase()}</span></button>)}</div>
+      <button className="server-icon add-server" onClick={onCreateCommunity} title="Criar nova comunidade"><Plus size={21} /></button>
+    </aside>
+    <aside className="channel-sidebar">
+      <div className="community-header"><span>Lobby de amizades</span><Users size={18} /></div>
+      <div className="community-scroll">
+        <div className="sidebar-section-title"><span>AMIGOS</span><span>{friends.length}</span></div>
+        {friends.length ? friends.map((friend) => { const profile = friend.other || {}; return <button key={friend.id} className="channel-row" onClick={() => onOpenFriend(friend)}><Avatar initials={(profile.display_name || 'AM').slice(0, 2).toUpperCase()} color={profile.avatar_color || 'blue'} online small image={profile.avatar_url} /><span>{profile.display_name || 'Amigo'}</span><MessageCircle size={15} /></button>; }) : <p className="social-empty">Adicione amigos para iniciar conversas privadas.</p>}
+        <div className="sidebar-section-title voice-title"><span>SOLICITAÇÕES</span><span>{requests.length}</span></div>
+        {requests.map((request) => <div className="social-row" key={request.id}><span className="social-avatar">{(request.other?.display_name || 'AM').slice(0, 2).toUpperCase()}</span><div><strong>{request.other?.display_name || 'Amigo'}</strong><small>Solicitação pendente</small></div><button onClick={() => onRespond(request, 'accepted')}>Aceitar</button></div>)}
+      </div>
+      <div className="profile-bar"><div className="profile-summary"><Avatar initials={(activeUser?.name || 'VC').slice(0, 2).toUpperCase()} color="green" online small image={activeUser?.avatar_url} /><span className="profile-text"><strong>{activeUser?.name || 'Você'}</strong><small>Lobby de amizades</small></span></div></div>
+    </aside>
+    <main className="main-panel"><header className="topbar"><div className="channel-heading"><Users size={21} /><strong>Lobby de amizades</strong><span className="heading-divider" /><span className="channel-description">Converse com seus amigos fora das comunidades.</span></div><div className="topbar-actions"><button className="topbar-icon" onClick={() => document.querySelector('.lobby-search')?.focus()} title="Adicionar amigo"><Plus size={20} /></button></div></header><section className="chat-layout"><div className="chat-content"><div className="welcome-card"><div className="welcome-icon"><Users size={27} /></div><h1>Seu lobby de amizades</h1><p>Este espaço é independente das comunidades. Escolha um amigo ao lado para abrir uma conversa privada.</p><div className="social-add lobby-add"><label>Adicionar por nome de exibição<input className="lobby-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Nome exato do amigo" /></label><button className="primary-button" onClick={onSearch}><Plus size={15} /> Adicionar</button></div></div>{requests.length > 0 && <div className="social-section lobby-requests"><h3>Solicitações recebidas <span>{requests.length}</span></h3>{requests.map((request) => <div className="social-row" key={request.id}><span className="social-avatar">{(request.other?.display_name || 'AM').slice(0, 2).toUpperCase()}</span><div><strong>{request.other?.display_name || 'Amigo'}</strong><small>Quer ser seu amigo</small></div><button onClick={() => onRespond(request, 'accepted')}>Aceitar</button><button className="social-reject" onClick={() => onRespond(request, 'declined')}>Recusar</button></div>)}</div>}</div><aside className="member-sidebar"><div className="member-group"><h3>SEUS AMIGOS — {friends.length}</h3>{friends.map((friend) => { const profile = friend.other || {}; return <button className="member-row" key={friend.id} onClick={() => onOpenFriend(friend)}><Avatar initials={(profile.display_name || 'AM').slice(0, 2).toUpperCase()} color={profile.avatar_color || 'blue'} online small image={profile.avatar_url} /><span><strong>{profile.display_name || 'Amigo'}</strong><small>Mensagem privada</small></span><MessageCircle size={15} /></button>; })}</div></aside></section></main>
+  </div>;
+}
+
+function DirectChatScreen({ activeUser, friend, messages, draft, setDraft, onSubmit, onBack, communities, currentCommunityId, onCommunity, onCreateCommunity }) {
+  const profile = friend?.other || friend || {};
+  const friendName = profile.display_name || 'Amigo';
+  return <div className="app-shell">
+    <aside className="server-rail"><button className="brand-mark" title="Voltar ao lobby" onClick={onBack}><span>A</span></button><div className="rail-divider" /><div className="community-rail-list"><button className="server-icon active" onClick={onBack} title="Lobby de amizades"><Users size={18} /></button>{communities.map((community) => <button key={community.id} className={`server-icon ${community.id === currentCommunityId ? 'active' : ''}`} onClick={() => onCommunity(community)} title={community.name}><span>{community.name.slice(0, 2).toUpperCase()}</span></button>)}</div><button className="server-icon add-server" onClick={onCreateCommunity} title="Criar nova comunidade"><Plus size={21} /></button></aside>
+    <aside className="channel-sidebar"><div className="community-header"><span>Mensagem privada</span><MessageCircle size={18} /></div><div className="community-scroll"><button className="channel-row selected" onClick={onBack}><Users size={18} /><span>Voltar ao lobby</span></button><div className="sidebar-section-title"><span>CONVERSA</span></div><div className="social-row"><span className="social-avatar">{friendName.slice(0, 2).toUpperCase()}</span><div><strong>{friendName}</strong><small>Amigo</small></div></div></div><div className="profile-bar"><div className="profile-summary"><Avatar initials={(activeUser?.name || 'VC').slice(0, 2).toUpperCase()} color="green" online small image={activeUser?.avatar_url} /><span className="profile-text"><strong>{activeUser?.name || 'Você'}</strong><small>Conversa privada</small></span></div></div></aside>
+    <main className="main-panel"><header className="topbar"><div className="channel-heading"><MessageCircle size={21} /><strong>{friendName}</strong><span className="heading-divider" /><span className="channel-description">Conversa privada</span></div><div className="topbar-actions"><button className="topbar-icon" onClick={onBack} title="Voltar ao lobby"><Users size={20} /></button></div></header><section className="chat-layout"><div className="chat-content"><div className="welcome-card"><div className="welcome-icon"><MessageCircle size={27} /></div><h1>Conversa com {friendName}</h1><p>As mensagens desta conversa são privadas entre vocês.</p></div><div className="message-list">{messages.map((message) => { const mine = message.sender_id === activeUser?.id; return <article className="message" key={message.id}><Avatar initials={(mine ? activeUser?.name : friendName || 'AM').slice(0, 2).toUpperCase()} color={mine ? 'green' : 'blue'} online={mine} image={mine ? activeUser?.avatar_url : profile.avatar_url} /><div className="message-body"><div className="message-meta"><strong>{mine ? 'Você' : friendName}</strong><time>{new Date(message.created_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' })}</time></div><p>{message.content}</p></div></article>; })}</div><form className="composer" onSubmit={onSubmit}><input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder={`Enviar mensagem privada para ${friendName}`} /><div className="composer-actions"><button className="send-button" type="submit" title="Enviar"><Send size={18} /></button></div></form></div><aside className="member-sidebar"><div className="member-group"><h3>AMIGO</h3><div className="member-row"><Avatar initials={friendName.slice(0, 2).toUpperCase()} color={profile.avatar_color || 'blue'} online small image={profile.avatar_url} /><span><strong>{friendName}</strong><small>Conversa privada</small></span></div></div></aside></section></main>
+  </div>;
 }
 
 function FriendsModal({ search, setSearch, requests, friends, status, onSearch, onRespond, onClose }) {
