@@ -1,6 +1,6 @@
 {
   "name": "cated",
-  "version": "0.1.10",
+  "version": "0.1.11",
   "description": "Aplicativo privado de comunicação entre amigos para Windows",
   "main": "electron/main.cjs",
   "author": "Cated",

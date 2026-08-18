@@ -820,7 +820,30 @@ function App() {
 
   async function respondToCommunityFriendInvite(invite, status) {
     if (!supabase || !session?.user?.id) return;
-    const { data, error } = await supabase.rpc('respond_to_community_friend_invite', { target_invite: invite.id, next_status: status });
+    let { data, error } = await supabase.rpc('respond_to_community_friend_invite', { target_invite: invite.id, next_status: status });
+    if (error && status === 'accepted') {
+      const { data: acceptedInvite, error: inviteError } = await supabase
+        .from('community_friend_invites')
+        .update({ status: 'accepted', updated_at: new Date().toISOString() })
+        .eq('id', invite.id)
+        .eq('invitee_id', session.user.id)
+        .eq('status', 'pending')
+        .select('community_id')
+        .maybeSingle();
+      if (!inviteError && acceptedInvite?.community_id) {
+        const { error: memberError } = await supabase
+          .from('community_members')
+          .insert({ community_id: acceptedInvite.community_id, user_id: session.user.id, role: 'Membro' });
+        if (!memberError || memberError.code === '23505') {
+          data = [{ community_name: invite.community?.name || 'uma comunidade' }];
+          error = null;
+        } else {
+          error = memberError;
+        }
+      } else {
+        error = inviteError || new Error('Convite não encontrado ou já respondido.');
+      }
+    }
     if (error) {
       setCommunityFriendInviteStatus(`Não foi possível responder ao convite: ${error.message}`);
       return;

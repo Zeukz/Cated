@@ -203,19 +203,19 @@ begin
     raise exception 'Este convite não está mais disponível.';
   end if;
 
-  update public.community_friend_invites
+  update public.community_friend_invites as cfi
      set status = next_status, updated_at = now()
-   where id = target_invite;
+   where cfi.id = target_invite;
 
   if next_status = 'accepted' then
     insert into public.community_members (community_id, user_id, role)
     values (invite_row.community_id, auth.uid(), 'Membro')
-    on conflict (community_id, user_id) do nothing;
+    on conflict do nothing;
   end if;
 
   return query
-  select c.id, c.name
-    from public.communities c
+  select c.id as community_id, c.name as community_name
+    from public.communities as c
    where c.id = invite_row.community_id;
 end;
 $$;
