@@ -49,3 +49,55 @@ begin
   alter publication supabase_realtime add table public.direct_messages;
 exception when duplicate_object then null;
 end $$;
+
+
+create or replace function public.is_accepted_friend(target_user uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select exists (
+    select 1
+      from public.friendships f
+     where f.status = 'accepted'
+       and ((f.requester_id = auth.uid() and f.addressee_id = target_user)
+         or (f.addressee_id = auth.uid() and f.requester_id = target_user))
+  );
+$$;
+
+grant execute on function public.is_accepted_friend(uuid) to authenticated;
+
+create or replace function public.send_direct_message(target_recipient uuid, message_content text)
+returns public.direct_messages
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  result public.direct_messages;
+  clean_content text := btrim(message_content);
+begin
+  if auth.uid() is null then
+    raise exception 'É necessário estar autenticado.';
+  end if;
+  if target_recipient = auth.uid() then
+    raise exception 'Você não pode enviar uma mensagem para si mesmo.';
+  end if;
+  if clean_content is null or char_length(clean_content) = 0 or char_length(clean_content) > 4000 then
+    raise exception 'A mensagem precisa ter entre 1 e 4000 caracteres.';
+  end if;
+  if not public.is_accepted_friend(target_recipient) then
+    raise exception 'Aceite a amizade antes de enviar mensagens privadas.';
+  end if;
+
+  insert into public.direct_messages (sender_id, recipient_id, content)
+  values (auth.uid(), target_recipient, clean_content)
+  returning * into result;
+
+  return result;
+end;
+$$;
+
+grant execute on function public.send_direct_message(uuid, text) to authenticated;

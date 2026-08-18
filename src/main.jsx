@@ -124,7 +124,9 @@ function App() {
   const [friendSearch, setFriendSearch] = useState('');
   const [friendRequests, setFriendRequests] = useState([]);
   const [friendsList, setFriendsList] = useState([]);
+  const [communityFriendInvites, setCommunityFriendInvites] = useState([]);
   const [friendStatus, setFriendStatus] = useState('');
+  const [communityFriendInviteStatus, setCommunityFriendInviteStatus] = useState('');
   const [inviteCode, setInviteCode] = useState('');
   const [communityInvite, setCommunityInvite] = useState('');
   const [showChannelCreator, setShowChannelCreator] = useState(false);
@@ -719,14 +721,21 @@ function App() {
     if (!supabase || !session?.user?.id) return undefined;
     let active = true;
     refreshSocialData();
+    refreshCommunityFriendInvites();
     const socialChannel = supabase.channel(`friendships:${session.user.id}`)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'friendships' }, () => {
         if (active) refreshSocialData();
       })
       .subscribe();
+    const communityInviteChannel = supabase.channel(`community-friend-invites:${session.user.id}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'community_friend_invites' }, () => {
+        if (active) refreshCommunityFriendInvites();
+      })
+      .subscribe();
     return () => {
       active = false;
       supabase.removeChannel(socialChannel);
+      supabase.removeChannel(communityInviteChannel);
     };
   }, [session?.user?.id]);
 
@@ -771,6 +780,56 @@ function App() {
     setFriendStatus(status === 'accepted' ? `Agora você e ${request.other?.display_name || 'seu amigo'} são amigos.` : 'Solicitação recusada.');
   }
 
+  async function refreshCommunityFriendInvites() {
+    if (!supabase || !session?.user?.id) return;
+    const { data: invites, error } = await supabase
+      .from('community_friend_invites')
+      .select('id,community_id,inviter_id,invitee_id,status,created_at,updated_at')
+      .eq('invitee_id', session.user.id)
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+    if (error || !invites?.length) {
+      setCommunityFriendInvites([]);
+      return;
+    }
+    const communityIds = [...new Set(invites.map((invite) => invite.community_id))];
+    const inviterIds = [...new Set(invites.map((invite) => invite.inviter_id))];
+    const [{ data: communities }, { data: profiles }] = await Promise.all([
+      supabase.from('communities').select('id,name,owner_id').in('id', communityIds),
+      supabase.from('profiles').select('id,display_name,avatar_color,avatar_url').in('id', inviterIds)
+    ]);
+    const communitiesById = Object.fromEntries((communities || []).map((community) => [community.id, community]));
+    const profilesById = Object.fromEntries((profiles || []).map((profile) => [profile.id, profile]));
+    setCommunityFriendInvites(invites.map((invite) => ({ ...invite, community: communitiesById[invite.community_id] || { id: invite.community_id, name: 'Comunidade' }, inviter: profilesById[invite.inviter_id] || { id: invite.inviter_id, display_name: 'Amigo' } })));
+  }
+
+  async function sendCommunityFriendInvite(friend) {
+    const friendId = friend?.other?.id || friend?.id;
+    if (!supabase || !session?.user?.id || !communityId || !friendId) return;
+    const { error } = await supabase.rpc('send_community_friend_invite', { target_community: communityId, target_friend: friendId });
+    if (error) {
+      setCommunityFriendInviteStatus(`Não foi possível convidar ${friend?.other?.display_name || 'este amigo'}: ${error.message}`);
+      return;
+    }
+    setCommunityFriendInviteStatus(`Convite enviado para ${friend?.other?.display_name || 'seu amigo'}.`);
+  }
+
+  async function respondToCommunityFriendInvite(invite, status) {
+    if (!supabase || !session?.user?.id) return;
+    const { data, error } = await supabase.rpc('respond_to_community_friend_invite', { target_invite: invite.id, next_status: status });
+    if (error) {
+      setCommunityFriendInviteStatus(`Não foi possível responder ao convite: ${error.message}`);
+      return;
+    }
+    await refreshCommunityFriendInvites();
+    if (status === 'accepted') {
+      setCommunityReload((current) => current + 1);
+      setCommunityFriendInviteStatus(`Você entrou em ${data?.[0]?.community_name || invite.community?.name || 'uma comunidade'}.`);
+    } else {
+      setCommunityFriendInviteStatus('Convite recusado.');
+    }
+  }
+
   function openLobby() {
     setViewMode('lobby');
     setSelectedFriend(null);
@@ -797,12 +856,18 @@ function App() {
     const content = draft.trim();
     const friendId = selectedFriend?.other?.id || selectedFriend?.id;
     if (!content || !friendId || !supabase || !session?.user?.id) return;
-    const { data, error } = await supabase.from('direct_messages').insert({ sender_id: session.user.id, recipient_id: friendId, content }).select('id,sender_id,recipient_id,content,created_at').single();
+    let { data, error } = await supabase.rpc('send_direct_message', { target_recipient: friendId, message_content: content });
     if (error) {
-      showNotice('Não foi possível enviar a mensagem privada. Aceite a amizade e tente novamente.');
+      const fallback = await supabase.from('direct_messages').insert({ sender_id: session.user.id, recipient_id: friendId, content }).select('id,sender_id,recipient_id,content,created_at').single();
+      data = fallback.data;
+      error = fallback.error;
+    }
+    const message = Array.isArray(data) ? data[0] : data;
+    if (error || !message) {
+      showNotice(`Não foi possível enviar a mensagem privada: ${error?.message || 'resposta vazia do servidor'}`);
       return;
     }
-    setDirectMessages((current) => current.some((item) => item.id === data.id) ? current : [...current, data]);
+    setDirectMessages((current) => current.some((item) => item.id === message.id) ? current : [...current, message]);
     setDraft('');
   }
 
@@ -1352,7 +1417,7 @@ function App() {
   }
 
   if (viewMode === 'lobby') {
-    return <LobbyScreen activeUser={activeUser} friends={friendsList} requests={friendRequests} search={friendSearch} setSearch={setFriendSearch} onSearch={sendFriendRequest} onRespond={respondToFriendRequest} onOpenFriend={openDirectChat} communities={communityRailItems} currentCommunityId={communityId} onCommunity={(item) => { setViewMode('community'); switchCommunity(item); }} onCreateCommunity={() => setShowCommunityCreator(true)} />;
+    return <LobbyScreen activeUser={activeUser} friends={friendsList} requests={friendRequests} communityInvites={communityFriendInvites} socialStatus={friendStatus} communityInviteStatus={communityFriendInviteStatus} search={friendSearch} setSearch={setFriendSearch} onSearch={sendFriendRequest} onRespond={respondToFriendRequest} onRespondCommunityInvite={respondToCommunityFriendInvite} onOpenFriend={openDirectChat} communities={communityRailItems} currentCommunityId={communityId} onCommunity={(item) => { setViewMode('community'); switchCommunity(item); }} onCreateCommunity={() => setShowCommunityCreator(true)} />;
   }
 
   if (viewMode === 'dm') {
@@ -1477,7 +1542,7 @@ function App() {
       {showChannelCreator && <Modal title="Criar canal" onClose={() => setShowChannelCreator(false)}><form className="creator-form" onSubmit={createChannel}><label>Nome do canal<input autoFocus value={newChannelName} onChange={(event) => setNewChannelName(event.target.value)} placeholder="ex.: ideias" /></label><label>Tipo<select value={newChannelType} onChange={(event) => setNewChannelType(event.target.value)}><option value="text">Canal de texto</option><option value="voice">Canal de voz</option></select></label><button className="primary-button" type="submit"><Plus size={16} /> Criar canal</button></form></Modal>}
       {showRoles && <Modal title={`Cargo de ${roleMember}`} onClose={() => setShowRoles(false)}><div className="role-picker"><p>Escolha o cargo deste membro:</p>{roles.map((role) => <button key={role} className={`role-option ${memberRoles[roleMember] === role ? 'active' : ''}`} onClick={() => assignRole(roleMember, role)}><span className={`role-dot role-${role.toLowerCase()}`} />{role}</button>)}<button className="role-add" onClick={() => { const next = `Cargo ${roles.length + 1}`; setRoles((current) => [...current, next]); showNotice(`${next} criado.`); }}><Plus size={15} /> Criar novo cargo</button></div></Modal>}
       {showFriends && <FriendsModal search={friendSearch} setSearch={setFriendSearch} requests={friendRequests} friends={friendsList} status={friendStatus} onSearch={sendFriendRequest} onRespond={respondToFriendRequest} onClose={() => setShowFriends(false)} />}
-      {showInvite && <InviteModal inviteCode={inviteCode} setInviteCode={setInviteCode} communityInvite={communityInvite} setCommunityInvite={setCommunityInvite} status={friendStatus} onCreate={createCommunityInvite} onAccept={acceptCommunityInvite} onClose={() => setShowInvite(false)} />}
+      {showInvite && <InviteModal inviteCode={inviteCode} setInviteCode={setInviteCode} communityInvite={communityInvite} setCommunityInvite={setCommunityInvite} status={friendStatus} friends={friendsList} directStatus={communityFriendInviteStatus} onInviteFriend={sendCommunityFriendInvite} onCreate={createCommunityInvite} onAccept={acceptCommunityInvite} onClose={() => setShowInvite(false)} />}
       {showCommunityCreator && <Modal title="Criar comunidade" onClose={() => setShowCommunityCreator(false)}><form className="creator-form" onSubmit={createCommunity}><p className="modal-note">A pessoa que criar a comunidade será o proprietário e administrador principal.</p><label>Nome da comunidade<input autoFocus value={newCommunityName} onChange={(event) => setNewCommunityName(event.target.value)} placeholder="ex.: Galera dos amigos" required /></label><button className="primary-button" type="submit"><Plus size={16} /> Criar comunidade</button></form></Modal>}
       {showCommunitySettings && <Modal title="Configurações da comunidade" wide onClose={() => setShowCommunitySettings(false)}><CommunitySettings name={communitySettingsName} setName={setCommunitySettingsName} roles={roles} newRoleName={newRoleName} setNewRoleName={setNewRoleName} canManage={isAdmin} owner={communityOwnerId === activeUser?.id} onSave={saveCommunitySettings} onCreateRole={createCommunityRole} onLeave={leaveCommunity} /></Modal>}
       {showSharePicker && <SharePicker sources={shareSources} sourceId={shareSourceId} setSourceId={setShareSourceId} quality={shareQuality} setQuality={setShareQuality} onStart={startSharing} onClose={() => setShowSharePicker(false)} />}
@@ -1560,7 +1625,7 @@ function ModerationMenu({ x, y, member, admin, canKick, self, onAction, onClose 
   return <ContextMenu x={x} y={y} items={items} onClose={onClose} />;
 }
 
-function LobbyScreen({ activeUser, friends, requests, search, setSearch, onSearch, onRespond, onOpenFriend, communities, currentCommunityId, onCommunity, onCreateCommunity }) {
+function LobbyScreen({ activeUser, friends, requests, communityInvites, socialStatus, communityInviteStatus, search, setSearch, onSearch, onRespond, onRespondCommunityInvite, onOpenFriend, communities, currentCommunityId, onCommunity, onCreateCommunity }) {
   return <div className="app-shell">
     <aside className="server-rail">
       <button className="brand-mark" title="Lobby de amizades"><span>A</span></button>
@@ -1575,10 +1640,12 @@ function LobbyScreen({ activeUser, friends, requests, search, setSearch, onSearc
         {friends.length ? friends.map((friend) => { const profile = friend.other || {}; return <button key={friend.id} className="channel-row" onClick={() => onOpenFriend(friend)}><Avatar initials={(profile.display_name || 'AM').slice(0, 2).toUpperCase()} color={profile.avatar_color || 'blue'} online small image={profile.avatar_url} /><span>{profile.display_name || 'Amigo'}</span><MessageCircle size={15} /></button>; }) : <p className="social-empty">Adicione amigos para iniciar conversas privadas.</p>}
         <div className="sidebar-section-title voice-title"><span>SOLICITAÇÕES</span><span>{requests.length}</span></div>
         {requests.map((request) => <div className="social-row" key={request.id}><span className="social-avatar">{(request.other?.display_name || 'AM').slice(0, 2).toUpperCase()}</span><div><strong>{request.other?.display_name || 'Amigo'}</strong><small>Solicitação pendente</small></div><button onClick={() => onRespond(request, 'accepted')}>Aceitar</button></div>)}
+        <div className="sidebar-section-title voice-title"><span>CONVITES DE COMUNIDADE</span><span>{communityInvites.length}</span></div>
+        {communityInvites.length ? communityInvites.map((invite) => <div className="social-row" key={invite.id}><span className="social-avatar">{(invite.community?.name || 'CO').slice(0, 2).toUpperCase()}</span><div><strong>{invite.community?.name || 'Comunidade'}</strong><small>de {invite.inviter?.display_name || 'Amigo'}</small></div><button onClick={() => onRespondCommunityInvite(invite, 'accepted')}>Aceitar</button></div>) : <p className="social-empty">Nenhum convite direto pendente.</p>}
       </div>
       <div className="profile-bar"><div className="profile-summary"><Avatar initials={(activeUser?.name || 'VC').slice(0, 2).toUpperCase()} color="green" online small image={activeUser?.avatar_url} /><span className="profile-text"><strong>{activeUser?.name || 'Você'}</strong><small>Lobby de amizades</small></span></div></div>
     </aside>
-    <main className="main-panel"><header className="topbar"><div className="channel-heading"><Users size={21} /><strong>Lobby de amizades</strong><span className="heading-divider" /><span className="channel-description">Converse com seus amigos fora das comunidades.</span></div><div className="topbar-actions"><button className="topbar-icon" onClick={() => document.querySelector('.lobby-search')?.focus()} title="Adicionar amigo"><Plus size={20} /></button></div></header><section className="chat-layout"><div className="chat-content"><div className="welcome-card"><div className="welcome-icon"><Users size={27} /></div><h1>Seu lobby de amizades</h1><p>Este espaço é independente das comunidades. Escolha um amigo ao lado para abrir uma conversa privada.</p><div className="social-add lobby-add"><label>Adicionar por nome de exibição<input className="lobby-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Nome exato do amigo" /></label><button className="primary-button" onClick={onSearch}><Plus size={15} /> Adicionar</button></div></div>{requests.length > 0 && <div className="social-section lobby-requests"><h3>Solicitações recebidas <span>{requests.length}</span></h3>{requests.map((request) => <div className="social-row" key={request.id}><span className="social-avatar">{(request.other?.display_name || 'AM').slice(0, 2).toUpperCase()}</span><div><strong>{request.other?.display_name || 'Amigo'}</strong><small>Quer ser seu amigo</small></div><button onClick={() => onRespond(request, 'accepted')}>Aceitar</button><button className="social-reject" onClick={() => onRespond(request, 'declined')}>Recusar</button></div>)}</div>}</div><aside className="member-sidebar"><div className="member-group"><h3>SEUS AMIGOS — {friends.length}</h3>{friends.map((friend) => { const profile = friend.other || {}; return <button className="member-row" key={friend.id} onClick={() => onOpenFriend(friend)}><Avatar initials={(profile.display_name || 'AM').slice(0, 2).toUpperCase()} color={profile.avatar_color || 'blue'} online small image={profile.avatar_url} /><span><strong>{profile.display_name || 'Amigo'}</strong><small>Mensagem privada</small></span><MessageCircle size={15} /></button>; })}</div></aside></section></main>
+    <main className="main-panel"><header className="topbar"><div className="channel-heading"><Users size={21} /><strong>Lobby de amizades</strong><span className="heading-divider" /><span className="channel-description">Converse com seus amigos fora das comunidades.</span></div><div className="topbar-actions"><button className="topbar-icon" onClick={() => document.querySelector('.lobby-search')?.focus()} title="Adicionar amigo"><Plus size={20} /></button></div></header><section className="chat-layout"><div className="chat-content"><div className="welcome-card"><div className="welcome-icon"><Users size={27} /></div><h1>Seu lobby de amizades</h1><p>Este espaço é independente das comunidades. Escolha um amigo ao lado para abrir uma conversa privada.</p><div className="social-add lobby-add"><label>Adicionar por nome de exibição<input className="lobby-search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Nome exato do amigo" /></label><button className="primary-button" onClick={onSearch}><Plus size={15} /> Adicionar</button></div>{socialStatus && <p className="social-status">{socialStatus}</p>}</div>{requests.length > 0 && <div className="social-section lobby-requests"><h3>Solicitações recebidas <span>{requests.length}</span></h3>{requests.map((request) => <div className="social-row" key={request.id}><span className="social-avatar">{(request.other?.display_name || 'AM').slice(0, 2).toUpperCase()}</span><div><strong>{request.other?.display_name || 'Amigo'}</strong><small>Quer ser seu amigo</small></div><button onClick={() => onRespond(request, 'accepted')}>Aceitar</button><button className="social-reject" onClick={() => onRespond(request, 'declined')}>Recusar</button></div>)}</div>}{communityInvites.length > 0 && <div className="social-section lobby-requests"><h3>Convites para comunidades <span>{communityInvites.length}</span></h3>{communityInvites.map((invite) => <div className="social-row" key={invite.id}><span className="social-avatar">{(invite.community?.name || 'CO').slice(0, 2).toUpperCase()}</span><div><strong>{invite.community?.name || 'Comunidade'}</strong><small>{invite.inviter?.display_name || 'Amigo'} convidou você</small></div><button onClick={() => onRespondCommunityInvite(invite, 'accepted')}>Aceitar</button><button className="social-reject" onClick={() => onRespondCommunityInvite(invite, 'declined')}>Recusar</button></div>)}</div>}{communityInviteStatus && <p className="social-status">{communityInviteStatus}</p>}</div><aside className="member-sidebar"><div className="member-group"><h3>SEUS AMIGOS — {friends.length}</h3>{friends.map((friend) => { const profile = friend.other || {}; return <button className="member-row" key={friend.id} onClick={() => onOpenFriend(friend)}><Avatar initials={(profile.display_name || 'AM').slice(0, 2).toUpperCase()} color={profile.avatar_color || 'blue'} online small image={profile.avatar_url} /><span><strong>{profile.display_name || 'Amigo'}</strong><small>Mensagem privada</small></span><MessageCircle size={15} /></button>; })}</div></aside></section></main>
   </div>;
 }
 
@@ -1596,9 +1663,9 @@ function FriendsModal({ search, setSearch, requests, friends, status, onSearch, 
   return <Modal title="Amigos" onClose={onClose}><div className="social-modal"><div className="social-add"><label>Adicionar por nome de exibição<input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Nome exato do amigo" /></label><button className="primary-button" onClick={onSearch}><Plus size={15} /> Adicionar</button></div>{status && <p className="social-status">{status}</p>}<div className="social-section"><h3>Solicitações recebidas <span>{requests.length}</span></h3>{requests.length ? requests.map((request) => <div className="social-row" key={request.id}><span className="social-avatar">{request.other.display_name.slice(0, 2).toUpperCase()}</span><div><strong>{request.other.display_name}</strong><small>Quer ser seu amigo</small></div><button onClick={() => onRespond(request, 'accepted')}>Aceitar</button><button className="social-reject" onClick={() => onRespond(request, 'declined')}>Recusar</button></div>) : <p className="social-empty">Nenhuma solicitação pendente.</p>}</div><div className="social-section"><h3>Seus amigos <span>{friends.length}</span></h3>{friends.length ? friends.map((friend) => <div className="social-row" key={friend.id}><span className="social-avatar">{friend.other.display_name.slice(0, 2).toUpperCase()}</span><div><strong>{friend.other.display_name}</strong><small>Amigo</small></div><span className="friend-online-dot" /></div>) : <p className="social-empty">Você ainda não adicionou amigos.</p>}</div></div></Modal>;
 }
 
-function InviteModal({ inviteCode, setInviteCode, communityInvite, setCommunityInvite, status, onCreate, onAccept, onClose }) {
+function InviteModal({ inviteCode, setInviteCode, communityInvite, setCommunityInvite, status, friends = [], directStatus, onInviteFriend, onCreate, onAccept, onClose }) {
   const inviteError = communityInvite?.startsWith('Erro') || communityInvite?.startsWith('Entre');
-  return <Modal title="Convites da comunidade" onClose={onClose}><div className="invite-modal"><p className="modal-note">Gere um código único para enviar aos seus amigos ou cole um código recebido para entrar em outra comunidade.</p><button className="primary-button" onClick={onCreate}><Plus size={15} /> Gerar novo convite</button>{communityInvite && <div className={inviteError ? 'invite-error' : 'generated-invite'}><span>{communityInvite}</span>{!inviteError && <button onClick={() => navigator.clipboard?.writeText(communityInvite)}>Copiar</button>}</div>}<div className="invite-divider"><span>ou entrar com um código</span></div><label>Código de convite<input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Cole o código aqui" /></label><button className="secondary-button invite-join" onClick={onAccept}>Entrar na comunidade</button>{status && <p className="social-status">{status}</p>}</div></Modal>;
+  return <Modal title="Convidar para a comunidade" onClose={onClose}><div className="invite-modal"><p className="modal-note">A forma recomendada é convidar um amigo aceito diretamente. Ele receberá o convite no lobby e poderá entrar com um clique.</p><div className="social-section"><h3>Convidar amigo aceito</h3>{friends.length ? friends.map((friend) => { const profile = friend.other || {}; return <div className="social-row" key={friend.id}><span className="social-avatar">{(profile.display_name || 'AM').slice(0, 2).toUpperCase()}</span><div><strong>{profile.display_name || 'Amigo'}</strong><small>Amigo aceito</small></div><button className="secondary-button" onClick={() => onInviteFriend(friend)}>Convidar</button></div>; }) : <p className="social-empty">Você ainda não tem amigos aceitos para convidar.</p>}{directStatus && <p className="social-status">{directStatus}</p>}</div><div className="invite-divider"><span>código alternativo</span></div><p className="modal-note">Se preferir, ainda é possível gerar um código temporário para compartilhar manualmente.</p><button className="secondary-button" onClick={onCreate}><Plus size={15} /> Gerar código</button>{communityInvite && <div className={inviteError ? 'invite-error' : 'generated-invite'}><span>{communityInvite}</span>{!inviteError && <button onClick={() => navigator.clipboard?.writeText(communityInvite)}>Copiar</button>}</div>}<div className="invite-divider"><span>entrar com código</span></div><label>Código de convite<input value={inviteCode} onChange={(event) => setInviteCode(event.target.value)} placeholder="Cole o código aqui" /></label><button className="secondary-button invite-join" onClick={onAccept}>Entrar na comunidade</button>{status && <p className="social-status">{status}</p>}</div></Modal>;
 }
 
 function SharePicker({ sources, sourceId, setSourceId, quality, setQuality, onStart, onClose }) {
